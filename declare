@@ -699,19 +699,152 @@ def rs_print(b, seq, path):
         f.write(base64.b64decode(pdf))
 
 
+TREASURY_CODE = "101001000"
+
+
+def _html_attr(tag, name):
+    m = re.search(
+        rf'\b{re.escape(name)}\s*=\s*(["\'])(.*?)\1',
+        tag,
+        re.I | re.S,
+    )
+    return m.group(2) if m else None
+
+
+def _has_html_attr(tag, name):
+    return bool(
+        re.search(
+            rf"\b{re.escape(name)}(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?",
+            tag,
+            re.I,
+        )
+    )
+
+
+def _selected_option(select_tag):
+    options = re.findall(
+        r"<option\b[^>]*>.*?</option\s*>",
+        select_tag,
+        re.I | re.S,
+    )
+    if not options:
+        options = re.findall(r"<option\b[^>]*>", select_tag, re.I | re.S)
+
+    parsed = []
+    for option in options:
+        value = _html_attr(option, "value")
+        if value is None:
+            continue
+        parsed.append((value, _has_html_attr(option, "selected")))
+
+    if not parsed:
+        return None
+
+    # HTML semantics: if no option is explicitly selected, the first option
+    # is the effective default.
+    for value, selected in parsed:
+        if selected:
+            return value
+    return parsed[0][0]
+
+
+def _validate_treasury_selection(html, fields):
+    """
+    Make sure the payment form itself selected the treasury code we expect.
+
+    We do not hard-code a radio/select field name because RS.ge may rename it.
+    Instead, find the control containing 101001000 and verify that this exact
+    option is the one that would be submitted.
+    """
+    radio_names = set()
+    for m in re.finditer(r"<input\b[^>]*>", html, re.I | re.S):
+        tag = m.group(0)
+        if (_html_attr(tag, "type") or "").lower() != "radio":
+            continue
+        if _html_attr(tag, "value") == TREASURY_CODE:
+            name = _html_attr(tag, "name")
+            if name:
+                radio_names.add(name)
+
+    if radio_names:
+        for name in radio_names:
+            if fields.get(name) == TREASURY_CODE:
+                return
+        raise Fail(
+            f"rs.ge выбрал другой казначейский код; ожидается {TREASURY_CODE}. "
+            "Оплата остановлена."
+        )
+
+    # Some versions of the form may expose the treasury choice as a <select>.
+    for m in re.finditer(
+        r"<select\b[^>]*>.*?</select\s*>", html, re.I | re.S
+    ):
+        select_tag = m.group(0)
+        name = _html_attr(select_tag, "name")
+        if not name:
+            continue
+
+        option_values = [
+            _html_attr(option, "value")
+            for option in re.findall(r"<option\b[^>]*>", select_tag, re.I | re.S)
+        ]
+        if TREASURY_CODE not in option_values:
+            continue
+
+        if fields.get(name) == TREASURY_CODE:
+            return
+        raise Fail(
+            f"rs.ge выбрал другой казначейский код; ожидается {TREASURY_CODE}. "
+            "Оплата остановлена."
+        )
+
+    raise Fail(
+        f"не найден выбор казначейского кода {TREASURY_CODE} "
+        "в платёжной форме rs.ge; оплата остановлена."
+    )
+
+
 def keepz_link(tin, payer_name, note, amount):
     req = urllib.request.Request(PAY_URL, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
         html, action = r.read().decode("utf-8", "replace"), r.url
+
     fields = {}
-    for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*>', html):
-        if 'type="submit"' in m.group(0):
+
+    # Only successful <input> controls should be submitted:
+    # - submit buttons are excluded;
+    # - for radio/checkbox groups, only the checked control is successful.
+    for m in re.finditer(r"<input\b[^>]*>", html, re.I | re.S):
+        tag = m.group(0)
+        input_type = (_html_attr(tag, "type") or "text").lower()
+
+        if input_type == "submit":
             continue
-        v = re.search(r'value="([^"]*)"', m.group(0))
-        fields[m.group(1)] = v.group(1) if v else ""
-    for m in re.finditer(r'<select name="([^"]+)".*?</select>', html, re.S):
-        opts = re.findall(r'<option[^>]*value="([^"]*)"', m.group(0))
-        fields[m.group(1)] = opts[0] if opts else ""
+        if input_type in ("radio", "checkbox") and not _has_html_attr(tag, "checked"):
+            continue
+
+        name = _html_attr(tag, "name")
+        if not name:
+            continue
+        fields[name] = _html_attr(tag, "value") or ""
+
+    # Preserve the form's selected <option>, rather than blindly choosing the
+    # first option. If the form has no explicit 'selected', the first option
+    # is the HTML default.
+    for m in re.finditer(
+        r"<select\b[^>]*>.*?</select\s*>", html, re.I | re.S
+    ):
+        select_tag = m.group(0)
+        name = _html_attr(select_tag, "name")
+        if not name:
+            continue
+        value = _selected_option(select_tag)
+        fields[name] = value if value is not None else ""
+
+    # Critical safety check: do not create a payment link unless the RS.ge
+    # form itself selected the expected treasury code for this tax payment.
+    _validate_treasury_selection(html, fields)
+
     fields.update(
         {
             "PayerSaidentno_TextBox": tin,
