@@ -318,11 +318,13 @@ class Browser:
     def js(self, expr, awaitp=False):
         r = self.send("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": awaitp})
         if "exceptionDetails" in r:
+            expression_hint = " ".join(expr.split())[:240]
             raise Fail(
                 "ошибка на странице: "
                 + json.dumps(
                     r["exceptionDetails"].get("exception", {}).get("description", r["exceptionDetails"])
                 )[:300]
+                + f"; JS: {expression_hint}"
             )
         return r.get("result", {}).get("value")
 
@@ -532,9 +534,34 @@ def manual_incomes(year, month):
     while True:
         amount = ask_amount(currency)
         day = ask_date(year, month)
-        incomes.append({"currency": currency, "amount": amount, "date": day})
+        inc = {"currency": currency, "amount": amount, "date": day}
+        inc["field"] = ask_income_field(inc)
+        incomes.append(inc)
         if ask("Ещё поступление в этом месяце? [y/N] ").lower() != "y":
             return incomes
+
+
+def ask_income_field(inc):
+    if inc is None:
+        say("\nКуда поступили платежи из Garna?")
+    else:
+        amount_label = (
+            f"{inc['gel_amount']:,.2f} GEL"
+            if "gel_amount" in inc
+            else f"{inc['amount']:,.2f} {inc['currency']}"
+        )
+        say(f"\nПлатёж {inc['date']}: {amount_label}")
+    say("Куда поступили деньги в момент расчёта с клиентом?")
+    say("  [1] Поле 21 — деньги пришли через Wise или другую платёжную систему/электронный кошелёк.")
+    say("  [2] Поле 20 — деньги пришли напрямую на банковский счёт, не через платёжную систему.")
+    say("Пример: баланс Wise → поле 21; прямой перевод клиента на грузинский банк → поле 20.")
+    while True:
+        choice = ask("Выберите поле [1/2]: ").strip()
+        if choice == "1":
+            return "21"
+        if choice == "2":
+            return "20"
+        say("Введите 1 или 2.")
 
 
 def rs_login(b):
@@ -616,7 +643,7 @@ def rs_read_mandatory(b):
             '  const visible = el => !!(el && el.getClientRects().length && el.getBoundingClientRect().width > 0 &&\n'
             '    getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none");\n'
             '  const textOf = el => ((el && (el.innerText || el.textContent)) || "").trim();\n'
-            '  const close = [...document.querySelectorAll(".CloseIcon, .ui-dialog-titlebar-close, [aria-label*=lose i]")]\n'
+            '  const close = [...document.querySelectorAll(".CloseIcon, .ui-dialog-titlebar-close")]\n'
             '    .find(visible);\n'
             '  const rsDialog = document.querySelector(".dialogShade .dialogContainer");\n'
             '  if (visible(rsDialog)) {\n'
@@ -651,7 +678,7 @@ def rs_read_mandatory(b):
             '  if (!modal) return null;\n'
             '  const text = textOf(modal);\n'
             '  const title = (modal.querySelector("h1, h2, h3, .ui-dialog-title") || {}).innerText || "";\n'
-            '  return { title: title.trim(), text: text, hasClose: !!modal.querySelector(".CloseIcon, .ui-dialog-titlebar-close, [aria-label*=lose i]") };\n'
+            '  return { title: title.trim(), text: text, hasClose: !!modal.querySelector(".CloseIcon, .ui-dialog-titlebar-close") };\n'
             '})()'
         )
         if not info:
@@ -801,8 +828,10 @@ def rs_taxpayer(b):
     return name, tin
 
 
-def rs_fill(b, income_str):
-    b.wait('document.querySelector("[id^=control_][id$=_20]")', timeout=20, what="форму декларации")
+def rs_fill(b, income_by_field):
+    field_selectors = {field: f'[id^=control_][id$=_{field}]' for field in ("20", "21")}
+    wait_selector = '[id^=control_][id$=_20], [id^=control_][id$=_21]'
+    b.wait(f'document.querySelector({json.dumps(wait_selector)})', timeout=20, what="форму декларации")
     b.pump(1)
     b.js(
         '(()=>{const c=[...document.querySelectorAll("*")].filter(x=>x.offsetParent&&x.children.length===0&&'
@@ -814,14 +843,17 @@ def rs_fill(b, income_str):
         '.querySelector("input[type=checkbox]");if(!cb.checked)cb.click()})()'
     )
     b.pump(2)
-    b.js(
-        '(()=>{const i=document.querySelector("[id^=control_][id$=_20]");i.focus();'
-        f'i.value="{income_str}";["input","change","keyup","blur"].forEach(t=>'
-        'i.dispatchEvent(new Event(t,{bubbles:true})))})()')
+    for field, selector in field_selectors.items():
+        value = f"{income_by_field[field]:.2f}"
+        b.js(
+            f'(()=>{{const i=document.querySelector({json.dumps(selector)});i.focus();'
+            f'i.value="{value}";["input","change","keyup","blur"].forEach(t=>'
+            'i.dispatchEvent(new Event(t,{bubbles:true})))})()')
+        b.pump(0.5)
     b.pump(2)
     return json.loads(
         b.js(
-            '(()=>JSON.stringify(Object.fromEntries(["15","17","20","26"].map(n=>[n,'
+            '(()=>JSON.stringify(Object.fromEntries(["15","17","20","21","26"].map(n=>[n,'
             'parseFloat(document.querySelector(`[id^=control_][id$=_${n}]`).value)]))))()'
         )
     )
@@ -1060,12 +1092,19 @@ def run(args):
             if not incomes:
                 say(f"За {label} поступлений в Garna нет. Нулевую декларацию скрипт не подаёт.")
                 return 0
+            say(f"\nGarna выгрузила {len(incomes)} платеж(ей).")
+            garna_field = ask_income_field(None)
+            for inc in incomes:
+                inc["field"] = garna_field
 
         total_raw = 0.0
+        field_raw = {"20": 0.0, "21": 0.0}
         for inc in incomes:
             inc["rate"] = nbg_rate(inc["currency"], inc["date"])
-            total_raw += inc["amount"] * inc["rate"]
+            inc["gel_amount"] = inc["amount"] * inc["rate"]
+            total_raw += inc["gel_amount"]
             say(f"  {inc['date']}: {inc['amount']:,.2f} {inc['currency']} x курс НБГ {inc['rate']:.4f}")
+            field_raw[inc["field"]] += inc["gel_amount"]
 
         # Стратегия округления
         round_up = args.round_up
@@ -1075,13 +1114,21 @@ def run(args):
 
         if round_up:
             income_gel = float(math.ceil(total_raw - 1e-9))
-            income_str = f"{int(income_gel)}"
         else:
             income_gel = round(total_raw, 2)
-            income_str = f"{income_gel:.2f}"
+
+        # Распределяем округлённый общий итог между полями 20 и 21.
+        income_by_field = {field: round(value, 2) for field, value in field_raw.items()}
+        rounding_delta = round(income_gel - sum(income_by_field.values()), 2)
+        if rounding_delta:
+            field_for_rounding = max(field_raw, key=field_raw.get)
+            income_by_field[field_for_rounding] = round(
+                income_by_field[field_for_rounding] + rounding_delta, 2
+            )
 
         tax = round(income_gel * 0.01, 2)
-        say(f"  итого доход {income_str} лари, налог 1% = {tax:.2f}\n")
+        say(f"  итого доход {income_gel:.2f} лари, налог 1% = {tax:.2f}")
+        say(f"  поле 20: {income_by_field['20']:.2f} GEL; поле 21: {income_by_field['21']:.2f} GEL\n")
 
         say("rs.ge: вход...")
         rs_login(b)
@@ -1109,18 +1156,20 @@ def run(args):
             period = rs_form_period(b)
             if period != f"{year}-{month:02d}":
                 raise Fail(f"rs.ge открыл декларацию за {period}, а считаем {year}-{month:02d}")
-            got = rs_fill(b, income_str)
+            got = rs_fill(b, income_by_field)
             b.snap("rs-form")
 
             # Расчет прогноза поля 15 на следующий месяц
             cumulative_before = float(got["15"] or 0.0)
-            cumulative_after = cumulative_before + float(got["20"] or 0.0)
+            cumulative_after = cumulative_before + float(got["17"] or 0.0)
             remaining_limit = max(0.0, SMALL_BUSINESS_LIMIT - cumulative_after)
 
-            if abs(got["20"] - income_gel) > 0.005 or abs(got["26"] - tax) > 0.005:
+            field_mismatch = any(abs(got[field] - income_by_field[field]) > 0.005 for field in ("20", "21"))
+            if field_mismatch or abs(got["17"] - income_gel) > 0.005 or abs(got["26"] - tax) > 0.005:
                 raise Fail(
                     f"rs.ge посчитал не то (ожидали доход {income_gel:.2f}, налог {tax:.2f}; "
-                    f"получили {got['20']:.2f} и {got['26']:.2f})"
+                    f"получили поля 20/21 = {got['20']:.2f}/{got['21']:.2f}, "
+                    f"итого {got['17']:.2f} и налог {got['26']:.2f})"
                 )
 
             # Вывод сводки данных перед подачей
@@ -1129,12 +1178,14 @@ def run(args):
             say("=" * 60)
             say("Поступления:")
             for inc in incomes:
-                gel_val = inc["amount"] * inc["rate"]
-                say(f"  • {inc['date']}: {inc['amount']:,.2f} {inc['currency']} (курс {inc['rate']:.4f}) = {gel_val:,.2f} GEL")
+                say(f"  • {inc['date']}: {inc['amount']:,.2f} {inc['currency']} "
+                    f"(курс {inc['rate']:.4f}) = {inc['gel_amount']:,.2f} GEL → поле {inc['field']}")
             say("-" * 60)
-            say(f"Поле 20 (доход за текущий месяц):       {got['20']:,.2f} GEL")
+            say(f"Поле 20 (банк):                          {got['20']:,.2f} GEL")
+            say(f"Поле 21 (Wise/платёжная система):        {got['21']:,.2f} GEL")
+            say(f"Итого за текущий месяц (поле 17):        {got['17']:,.2f} GEL")
             say(f"Поле 15 (накоплено до этого месяца):     {cumulative_before:,.2f} GEL")
-            say(f"Прогноз поля 15 на след. месяц (15+20):  {cumulative_after:,.2f} GEL")
+            say(f"Прогноз поля 15 на след. месяц (15+17):  {cumulative_after:,.2f} GEL")
             if cumulative_after > SMALL_BUSINESS_LIMIT:
                 say(f"⚠️  ВНИМАНИЕ: превышен лимит 500,000 GEL (превышение: {cumulative_after - SMALL_BUSINESS_LIMIT:,.2f} GEL)!")
             else:
